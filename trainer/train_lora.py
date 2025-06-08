@@ -1,6 +1,7 @@
 import os
 import sys
 
+
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -17,6 +18,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from dataset.lm_dataset import SFTDataset
 from model.model_lora import load_lora, save_lora, apply_lora
+import json
 
 warnings.filterwarnings('ignore')
 
@@ -35,59 +37,67 @@ def get_lr(current_step, total_steps, lr):
 def train_epoch(epoch, wandb):
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
-    for step, (X, Y, loss_mask) in enumerate(train_loader):
-        X = X.to(args.device)
-        Y = Y.to(args.device)
-        loss_mask = loss_mask.to(args.device)
-        lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch, args.learning_rate)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+    with open("losslog.jsonl", "a", encoding="utf-8") as f:
+        for step, (X, Y, loss_mask) in enumerate(train_loader):
+            X = X.to(args.device)
+            Y = Y.to(args.device)
+            loss_mask = loss_mask.to(args.device)
+            lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch, args.learning_rate)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
 
-        with ctx:
-            res = model(X)
-            loss = loss_fct(
-                res.logits.view(-1, res.logits.size(-1)),
-                Y.view(-1)
-            ).view(Y.size())
-            loss = (loss * loss_mask).sum() / loss_mask.sum()
-            loss += res.aux_loss
-            loss = loss / args.accumulation_steps
+            with ctx:
+                res = model(X)
+                loss = loss_fct(
+                    res.logits.view(-1, res.logits.size(-1)),
+                    Y.view(-1)
+                ).view(Y.size())
+                loss = (loss * loss_mask).sum() / loss_mask.sum()
+                loss += res.aux_loss
+                loss = loss / args.accumulation_steps
+                log_data = {
+                    "epoch": epoch,
+                    "step": step,
+                    "loss": loss.item(),
+                    "lr": lr
+                }
+                f.write(json.dumps(log_data, ensure_ascii=False) + "\n")
 
-        scaler.scale(loss).backward()
+            scaler.scale(loss).backward()
 
-        if (step + 1) % args.accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
+            if (step + 1) % args.accumulation_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
 
-            scaler.step(optimizer)
-            scaler.update()
+                scaler.step(optimizer)
+                scaler.update()
 
-            optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad(set_to_none=True)
 
-        if step % args.log_interval == 0:
-            spend_time = time.time() - start_time
-            Logger(
-                'Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.12f} epoch_Time:{}min:'.format(
-                    epoch + 1,
-                    args.epochs,
-                    step,
-                    iter_per_epoch,
-                    loss.item() * args.accumulation_steps,
-                    optimizer.param_groups[-1]['lr'],
-                    spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60))
+            if step % args.log_interval == 0:
+                spend_time = time.time() - start_time
+                Logger(
+                    'Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.12f} epoch_Time:{}min:'.format(
+                        epoch + 1,
+                        args.epochs,
+                        step,
+                        iter_per_epoch,
+                        loss.item() * args.accumulation_steps,
+                        optimizer.param_groups[-1]['lr'],
+                        spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60))
 
-            if (wandb is not None) and (not ddp or dist.get_rank() == 0):
-                wandb.log({"loss": loss * args.accumulation_steps,
-                           "lr": optimizer.param_groups[-1]['lr'],
-                           "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60})
+                if (wandb is not None) and (not ddp or dist.get_rank() == 0):
+                    wandb.log({"loss": loss * args.accumulation_steps,
+                            "lr": optimizer.param_groups[-1]['lr'],
+                            "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60})
 
-        if (step + 1) % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
-            model.eval()
-            lora_save_path = f'{args.save_dir}/lora/{args.lora_name}_{lm_config.hidden_size}.pth'
-            os.makedirs(os.path.dirname(lora_save_path), exist_ok=True)
-            # 【区别1】只保存lora权重即可
-            save_lora(model, lora_save_path)
-            model.train()
+            if (step + 1) % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
+                model.eval()
+                lora_save_path = f'{args.save_dir}/lora/{args.lora_name}_{lm_config.hidden_size}.pth'
+                os.makedirs(os.path.dirname(lora_save_path), exist_ok=True)
+                # 【区别1】只保存lora权重即可
+                save_lora(model, lora_save_path)
+                model.train()
 
 
 def init_model(lm_config):
@@ -165,7 +175,7 @@ if __name__ == "__main__":
     if args.use_wandb and (not ddp or ddp_local_rank == 0):
         import wandb
 
-        wandb.init(project=args.wandb_project, name=args.wandb_run_name)
+        wandb.init(project=args.wandb_project, name=args.wandb_run_name,settings = wandb.Settings(init_timeout=120))
     else:
         wandb = None
 
