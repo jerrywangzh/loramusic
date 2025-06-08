@@ -195,8 +195,8 @@ if __name__ == "__main__":
         train_ds,
         batch_size=args.batch_size,
         pin_memory=True,
-        drop_last=False,
-        shuffle=False,
+        drop_last=True,
+        shuffle=True,
         num_workers=args.num_workers,
         sampler=train_sampler
     )
